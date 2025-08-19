@@ -173,6 +173,30 @@ struct ModelMatchResult {
 //    R1.is_match(ua).unwrap() && !R2.is_match(ua) && !R3.is_match(ua).unwrap() && !R4.is_match(ua).unwrap()
 //}
 
+/// Mapping FormFactor types to device types based on priority
+/// (not sorted - the order defines priority for device type result)
+fn get_device_type_from_form_factors(form_factors: &[String]) -> Option<DeviceType> {
+    // FormFactors mapping in priority order
+    let form_factor_mapping = [
+        ("automotive", DeviceType::CarBrowser),
+        ("xr", DeviceType::Wearable),
+        ("watch", DeviceType::Wearable),
+        ("eink", DeviceType::Tablet),
+        ("mobile", DeviceType::SmartPhone),
+        ("tablet", DeviceType::Tablet),
+        ("desktop", DeviceType::Desktop),
+    ];
+
+    // Check for each form factor in the provided list
+    for (form_factor_name, device_type) in &form_factor_mapping {
+        if form_factors.iter().any(|f| f == form_factor_name) {
+            return Some(device_type.clone());
+        }
+    }
+
+    None
+}
+
 pub fn lookup(
     ua: &str,
     client: Option<&Client>,
@@ -249,10 +273,31 @@ pub fn lookup(
     if let Some(client_hints) = client_hints {
         if device.model.is_none() && client_hints.model.is_some() {
             device.model = client_hints.model.clone();
+            
+            // If we got a model from client hints, try to detect device type from the model
+            if device.device_type.is_none() {
+                if let Some(model) = &device.model {
+                    // Create a synthetic UA containing the model to trigger device detection
+                    let model_ua = format!("Android; {}", model);
+                    if let Some(mobile_device) = mobiles::lookup(&model_ua)? {
+                        device.device_type = mobile_device.device_type;
+                        if device.brand.is_none() {
+                            device.brand = mobile_device.brand;
+                        }
+                        // Update the model to the properly formatted name from the device database
+                        device.model = mobile_device.model;
+                    }
+                }
+            }
         }
 
         if client_hints.mobile {
             device.mobile_client_hint = true;
+        }
+
+        // Check FormFactors for device type detection
+        if device.device_type.is_none() && !client_hints.form_factors.is_empty() {
+            device.device_type = get_device_type_from_form_factors(&client_hints.form_factors);
         }
     }
 
@@ -352,6 +397,11 @@ pub fn lookup(
         if device.device_type.is_none() && os.name == "Java ME" {
             device.device_type = Some(DeviceType::FeaturePhone);
         }
+        
+        // KaiOS devices are always feature phones, even if detected as smartphones
+        if os.name == "KaiOS" {
+            device.device_type = Some(DeviceType::FeaturePhone);
+        }
 
         if device.device_type.is_none() {
             if os.name == "Windows RT" {
@@ -369,47 +419,73 @@ pub fn lookup(
         }
     }
 
+    // Puffin browser device type detection patterns
+    static PUFFIN_DESKTOP: Lazy<Regex> = static_user_agent_match!(r#"Puffin/(?:\d+[.\d]+)[LMW]D"#);
+    static PUFFIN_SMARTPHONE: Lazy<Regex> = static_user_agent_match!(r#"Puffin/(?:\d+[.\d]+)[AIFLW]P"#);
+    static PUFFIN_TABLET: Lazy<Regex> = static_user_agent_match!(r#"Puffin/(?:\d+[.\d]+)[AILW]T"#);
+
+    // Check for Puffin browser device type patterns first
+    if device.device_type.is_none() && PUFFIN_DESKTOP.is_match(&ua)? {
+        device.device_type = Some(DeviceType::Desktop);
+    }
+    if device.device_type.is_none() && PUFFIN_SMARTPHONE.is_match(&ua)? {
+        device.device_type = Some(DeviceType::SmartPhone);
+    }
+    if device.device_type.is_none() && PUFFIN_TABLET.is_match(&ua)? {
+        device.device_type = Some(DeviceType::Tablet);
+    }
+
     static OPERA: Lazy<Regex> = static_user_agent_match!(r#"Opera TV Store| OMI/"#);
     static ANDR0ID: Lazy<Regex> =
         static_user_agent_match!(r#"Andr0id|(?:Android(?: UHD)?|Google) TV|\(lite\) TV|BRAVIA'"#);
     static TIZEN: Lazy<Regex> = static_user_agent_match!(r#"SmartTV|Tizen.+ TV .+$"#);
     static GENERIC_TV: Lazy<Regex> = static_user_agent_match!(r#"\(TV;"#);
 
-    if OPERA.is_match(&ua)? {
-        device.device_type = Some(DeviceType::Television);
-    }
-    if ANDR0ID.is_match(&ua)? {
-        device.device_type = Some(DeviceType::Television);
-    }
-    if device.device_type.is_none() && TIZEN.is_match(&ua)? {
-        device.device_type = Some(DeviceType::Television);
-    }
-
-    if let Some(client) = client {
-        if [
-            "Kylo",
-            "Espial TV Browser",
-            "LUJO TV Browser",
-            "LogicUI TV Browser",
-            "Open TV Browser",
-            "Seraphic Sraf",
-            "Opera Devices",
-            "Crow Browser",
-            "Vewd Browser",
-            "TiviMate",
-            "Quick Search TV",
-            "QJY TV Browser",
-            "TV Bro",
-        ]
-        .iter()
-        .any(|x| *x == client.name)
-        {
+    // Only set TV type if device is not already detected as TV or Peripheral
+    let should_check_tv = match &device.device_type {
+        Some(DeviceType::Television) | Some(DeviceType::Peripheral) => false,
+        _ => true,
+    };
+    
+    if should_check_tv {
+        if OPERA.is_match(&ua)? {
+            device.device_type = Some(DeviceType::Television);
+        }
+        if ANDR0ID.is_match(&ua)? {
+            device.device_type = Some(DeviceType::Television);
+        }
+        if device.device_type.is_none() && TIZEN.is_match(&ua)? {
             device.device_type = Some(DeviceType::Television);
         }
     }
 
-    if device.device_type.is_none() && GENERIC_TV.is_match(&ua)? {
-        device.device_type = Some(DeviceType::Television);
+    if should_check_tv {
+        if let Some(client) = client {
+            if [
+                "Kylo",
+                "Espial TV Browser",
+                "LUJO TV Browser",
+                "LogicUI TV Browser",
+                "Open TV Browser",
+                "Seraphic Sraf",
+                "Opera Devices",
+                "Crow Browser",
+                "Vewd Browser",
+                "TiviMate",
+                "Quick Search TV",
+                "QJY TV Browser",
+                "TV Bro",
+            ]
+            .iter()
+            .any(|x| *x == client.name)
+            {
+                device.device_type = Some(DeviceType::Television);
+            }
+        }
+
+        if device.device_type.is_none() && GENERIC_TV.is_match(&ua)? {
+            device.device_type = Some(DeviceType::Television);
+        }
     }
 
     static DESKTOP_FRAGMENT: Lazy<Regex> =
@@ -430,6 +506,12 @@ pub fn lookup(
     if device.device_type.is_none() && is_desktop(os_info, client) {
         device.device_type = Some(DeviceType::Desktop);
     }
+    
+    // If user agent contains KaiOS but device type is still not detected, it's a feature phone
+    static KAIOS_UA: Lazy<Regex> = static_user_agent_match!(r#"KaiOS"#);
+    if device.device_type.is_none() && KAIOS_UA.is_match(&ua)? {
+        device.device_type = Some(DeviceType::FeaturePhone);
+    }
 
     if device.device_type.is_none() && device.brand.is_none() && device.model.is_none() {
         Ok(None)
@@ -444,14 +526,18 @@ fn is_desktop(os: Option<&OS>, client: Option<&Client>) -> bool {
         return false;
     }
 
-    if let Some(client) = &client {
-        if uses_mobile_browser(client) {
-            return false;
-        }
-    }
-
+    // Check OS first - if it's a desktop OS, handle mobile_only browsers carefully
     if let Some(os) = &os {
-        return os.desktop;
+        if os.desktop {
+            if let Some(client) = &client {
+                if uses_mobile_browser(client) {
+                    // Only allow specific mobile browsers that genuinely run on desktop
+                    // DuckDuckGo Privacy Browser runs on both mobile and desktop platforms
+                    return client.name == "DuckDuckGo Privacy Browser";
+                }
+            }
+            return true;
+        }
     }
 
     false

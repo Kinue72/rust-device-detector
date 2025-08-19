@@ -47,6 +47,7 @@ pub struct ClientHint {
     pub platform_version: Option<String>,
     pub full_version_list: Vec<(String, String)>,
     pub app: Option<String>,
+    pub form_factors: Vec<String>,
 }
 
 impl ClientHint {
@@ -59,6 +60,7 @@ impl ClientHint {
         let mut platform = None;
         let mut platform_version = None;
         let mut app = None;
+        let mut form_factors: Vec<String> = Vec::new();
 
         let mut full_version_list: Vec<(String, String)> = Vec::new();
 
@@ -105,7 +107,7 @@ impl ClientHint {
                     }
                 }
 
-                "x-requested-with" => {
+                "x-requested-with" | "http-x-requested-with" => {
                     if value != "xmlhttprequest" {
                         app = Some(value.to_owned());
                     }
@@ -137,6 +139,20 @@ impl ClientHint {
                         full_version_list.push((brand.to_owned(), brand_version.to_owned()));
                     }
                 }
+
+                "sec-ch-ua-form-factors" | "formfactors" | "http-sec-ch-ua-form-factors" => {
+                    // Parse FormFactors header - can be array or quoted string format
+                    static FORM_FACTOR_REGEX: Lazy<Regex> =
+                        Lazy::new(|| Regex::new(r#""([a-z]+)""#).unwrap());
+                    
+                    form_factors.clear();
+                    for cap in FORM_FACTOR_REGEX.captures_iter(&value.to_lowercase()) {
+                        let cap = cap?;
+                        if let Some(factor) = cap.get(1) {
+                            form_factors.push(factor.as_str().to_owned());
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -151,6 +167,7 @@ impl ClientHint {
             platform_version,
             full_version_list,
             app,
+            form_factors,
         };
 
         // println!("client hints: {:?}", res);

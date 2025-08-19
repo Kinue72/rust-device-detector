@@ -314,8 +314,11 @@ fn parse_platform(ua: &str, client_hints: Option<&ClientHint>) -> Result<Option<
     static MIPS_REG: Lazy<Regex> = static_user_agent_match!("mips");
     static SH4_REG: Lazy<Regex> = static_user_agent_match!("sh4");
     static SPARC64_REG: Lazy<Regex> = static_user_agent_match!("sparc64");
-    static X64_REG: Lazy<Regex> =
-        static_user_agent_match!("64-?bit|WOW64|(?:Intel)?x64|WINDOWS_64|win64|amd64|x86_?64");
+    static X64_REG: Lazy<Regex> = Lazy::new(|| {
+        // Don't match device model names like "Elephone_P3000S-64bit"
+        // The negative lookbehind ensures we don't match if preceded by a letter or underscore
+        Regex::new(r"(?i)(?<![\w_-])(?:64-?bit|WOW64|(?:Intel)?x64|WINDOWS_64|win64|x86_?64)\b|.*amd64").expect("x64 regex")
+    });
     static X86_REG: Lazy<Regex> = static_user_agent_match!(".*32bit|.*win32|(?:i[0-9]|x)86|i86pc");
 
     if ARM_REG.is_match(ua)? {
