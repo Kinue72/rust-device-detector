@@ -19,8 +19,37 @@ use crate::known_browsers::AvailableBrowsers;
 use crate::parsers::utils::LazyRegex;
 
 pub mod engines;
+use engines::detect_engine_version;
 
 use once_cell::sync::Lazy;
+
+// Helper function to extract version from user agent for app-based browsers
+fn extract_version_from_ua(ua: &str, app_hint: &str) -> Result<Option<String>> {
+    // Escape special regex characters in the app hint
+    let escaped_app = app_hint.replace(".", r"\.");
+    let pattern = format!(r"{}/(\d+[\.\d]+)", escaped_app);
+    let regex = Regex::new(&pattern)?;
+    
+    if let Some(captures) = regex.captures(ua)? {
+        if let Some(version_match) = captures.get(1) {
+            return Ok(Some(version_match.as_str().to_owned()));
+        }
+    }
+    
+    Ok(None)
+}
+
+// Browsers that need special version handling early in the process before other logic runs
+const BROWSERS_NEEDING_EARLY_VERSION_HANDLING: &[&str] = &[
+    "Atom",           // Needs UA version instead of client hints version
+    "Huawei Browser", // Needs UA version for accurate detection
+    "Mi Browser",     // Needs UA version due to client hints inconsistencies
+];
+
+// Browsers that need user agent version after standard processing (final override)
+const BROWSERS_USING_UA_VERSION_FINAL: &[&str] = &[
+    "Aloha Browser", "JioSphere", "mCent", "Opera", "Opera Mini", "Opera Mobile"
+];
 
 static CLIENT_LIST: Lazy<BrowserClientList> = Lazy::new(|| {
     let contents = include_str!(concat!(
@@ -51,6 +80,7 @@ static CLIENT_HINT_MAPPING: Lazy<ClientHintMapping> = Lazy::new(|| {
             vec!["Norton Secure Browser".to_owned()],
         ),
         ("Vewd Browser".to_owned(), vec!["Vewd Core".to_owned()]),
+        ("Mi Browser".to_owned(), vec!["Miui Browser".to_owned()]),
     ])
 });
 
@@ -81,13 +111,48 @@ pub fn lookup(ua: &str, client_hints: Option<&ClientHint>) -> Result<Option<Clie
             } else {
                 Some(brand_version.to_owned())
             };
+            
+            // Determine engine based on browser
+            let mut engine = None;
+            let mut engine_version = None;
+            
+            // Chrome, Chromium, Edge and Chrome-based browsers use Blink engine
+            if ["Chrome", "Chromium", "Microsoft Edge", "Edge", "CCleaner", "AVG Secure Browser", "Avast Secure Browser"].contains(&brand_result.name.as_str()) {
+                engine = Some("Blink".to_owned());
+                
+                // First get engine version from User Agent (like PHP does)
+                let ua_engine_version = detect_engine_version(ua, "Blink").unwrap_or(None);
+                
+                // Get client hints version for comparison
+                // PHP uses the browser version from client hints as engine version
+                let client_hints_version = version.clone();
+                
+                // Follow PHP logic: use client hints version only if it's more detailed than UA version
+                // and the browser is not "Iridium"
+                if brand_result.name != "Iridium" {
+                    if let (Some(ua_version), Some(ch_version)) = (&ua_engine_version, &client_hints_version) {
+                        // Use client hints version if it's greater than UA version
+                        if version_compare::compare(ch_version, ua_version) == Ok(version_compare::Cmp::Gt) {
+                            engine_version = client_hints_version;
+                        } else {
+                            engine_version = ua_engine_version;
+                        }
+                    } else {
+                        // Fallback: use whichever version is available
+                        engine_version = client_hints_version.or(ua_engine_version);
+                    }
+                } else {
+                    // For Iridium, always use UA version
+                    engine_version = ua_engine_version;
+                }
+            }
 
             let res = Client {
                 name: brand_result.name.clone(),
                 version,
                 r#type: ClientType::Browser,
-                engine: None,
-                engine_version: None,
+                engine,
+                engine_version: engine_version.clone(),
                 browser: Some(brand_result.to_owned()),
             };
             Some(res)
@@ -123,7 +188,8 @@ pub fn lookup(ua: &str, client_hints: Option<&ClientHint>) -> Result<Option<Clie
             }
         }
 
-        if client_from_hints.name == "Atom" || client_from_hints.name == "Huawei Browser" {
+        // Some browsers need special version handling early in the process
+        if BROWSERS_NEEDING_EARLY_VERSION_HANDLING.contains(&client_from_hints.name.as_str()) {
             client_from_hints.version = client_from_ua
                 .as_ref()
                 .map(|x| x.version.clone())
@@ -175,7 +241,17 @@ pub fn lookup(ua: &str, client_hints: Option<&ClientHint>) -> Result<Option<Clie
                         == client.browser.as_ref().map(|x| &x.family)
                 {
                     client_from_hints.engine = client.engine.clone();
-                    client_from_hints.engine_version = client.engine_version.clone();
+                    // Only override engine version if client hints doesn't have one, or if UA version is more detailed
+                    if let (Some(ua_engine_version), Some(ch_engine_version)) = (&client.engine_version, &client_from_hints.engine_version) {
+                        // Keep the more detailed version
+                        if version_compare::compare(ua_engine_version, ch_engine_version) == Ok(version_compare::Cmp::Gt) {
+                            client_from_hints.engine_version = client.engine_version.clone();
+                        }
+                        // Otherwise keep the client hints version
+                    } else if client_from_hints.engine_version.is_none() {
+                        // If client hints has no engine version, use UA version
+                        client_from_hints.engine_version = client.engine_version.clone();
+                    }
                 }
             }
         }
@@ -183,20 +259,41 @@ pub fn lookup(ua: &str, client_hints: Option<&ClientHint>) -> Result<Option<Clie
         if let Some(client) = &client_from_ua {
             if client_from_hints.name == client.name {
                 client_from_hints.engine = client.engine.clone();
-                client_from_hints.engine_version = client.engine_version.clone();
+                // Only override engine version if client hints doesn't have one, or if UA version is more detailed
+                if let (Some(ua_engine_version), Some(ch_engine_version)) = (&client.engine_version, &client_from_hints.engine_version) {
+                    // Keep the more detailed version
+                    if version_compare::compare(ua_engine_version, ch_engine_version) == Ok(version_compare::Cmp::Gt) {
+                        client_from_hints.engine_version = client.engine_version.clone();
+                    }
+                    // Otherwise keep the client hints version
+                } else if client_from_hints.engine_version.is_none() {
+                    // If client hints has no engine version, use UA version
+                    client_from_hints.engine_version = client.engine_version.clone();
+                }
+            }
+        }
 
-                #[allow(clippy::collapsible_if)]
-                if let Some(client_version) = &client.version {
-                    if let Some(client_from_hints_version) = &client_from_hints.version {
-                        if client_version.starts_with(client_from_hints_version) {
-                            if version_compare::compare(client_from_hints_version, client_version)
-                                .unwrap_or(Cmp::Eq)
-                                == Cmp::Lt
-                            {
-                                client_from_hints.version = client.version.clone();
-                            }
+        // In case the user agent reports a more detailed version, we try to use this instead
+        // This applies regardless of whether browser names match (e.g., "106.0.0.0" vs "106")
+        if let Some(client) = &client_from_ua {
+            if let Some(client_version) = &client.version {
+                if let Some(client_from_hints_version) = &client_from_hints.version {
+                    if client_version.starts_with(client_from_hints_version) {
+                        // If the user agent version is longer/more detailed than the client hints version,
+                        // use the more detailed version from the user agent
+                        if client_version.len() > client_from_hints_version.len() {
+                            client_from_hints.version = client.version.clone();
                         }
                     }
+                }
+            }
+        }
+
+        // Additional browsers that need user agent version (handled after name resolution)
+        if let Some(client) = &client_from_ua {
+            if !client.version.as_ref().unwrap_or(&String::new()).is_empty() {
+                if BROWSERS_USING_UA_VERSION_FINAL.contains(&client_from_hints.name.as_str()) {
+                    client_from_hints.version = client.version.clone();
                 }
             }
         }
@@ -204,20 +301,63 @@ pub fn lookup(ua: &str, client_hints: Option<&ClientHint>) -> Result<Option<Clie
 
     let mut res = client_from_hints.or(client_from_ua);
 
+    // Special handling for Opera Mobile with WebView
+    // If Chrome WebView is detected but the UA contains OPR/, it's actually Opera Mobile
+    if let Some(client) = res.as_mut() {
+        if client.name == "Chrome Webview" && ua.contains(" OPR/") {
+            // Re-detect as Opera Mobile
+            static OPERA_MOBILE_REGEX: Lazy<Regex> = Lazy::new(|| {
+                Regex::new(r"Mobile.+OPR/(\d+[\.\d]+)").expect("valid opera mobile regex")
+            });
+            
+            if let Some(captures) = OPERA_MOBILE_REGEX.captures(ua)? {
+                if let Some(version_match) = captures.get(1) {
+                    client.name = "Opera Mobile".to_owned();
+                    client.version = Some(version_match.as_str().to_owned());
+                    client.engine = Some("Blink".to_owned());
+                    
+                    // Extract Chrome/Blink engine version
+                    static CHROME_VERSION_REGEX: Lazy<Regex> = Lazy::new(|| {
+                        Regex::new(r"Chrome/(\d+[\.\d]+)").expect("valid chrome version regex")
+                    });
+                    
+                    if let Some(chrome_captures) = CHROME_VERSION_REGEX.captures(ua)? {
+                        if let Some(chrome_version) = chrome_captures.get(1) {
+                            client.engine_version = Some(chrome_version.as_str().to_owned());
+                        }
+                    }
+                    
+                    if let Some(browser) = AVAILABLE_BROWSERS.search_by_name("Opera Mobile") {
+                        client.browser = Some(browser.to_owned());
+                    }
+                }
+            }
+        }
+    }
+
     if let Some(client) = res.as_mut() {
         if let Some(client_hints) = client_hints {
             if let Some(app_hint) = &client_hints.app {
                 if let Some(app_name) = super::hints::browsers::get_hint(app_hint)? {
                     if client.name != app_name {
                         client.name = app_name.to_owned();
-                        client.version = None;
+                        
+                        // Try to extract version from user agent for the app-based browser
+                        client.version = extract_version_from_ua(ua, app_hint)?;
 
                         if let Some(browser) = AVAILABLE_BROWSERS.search_by_name(app_name) {
                             static BLINK_REGEX: Lazy<Regex> = Lazy::new(|| {
                                 Regex::new(r"Chrome/.+ Safari/537.36").expect("valid blink regex")
                             });
 
-                            if BLINK_REGEX.is_match(ua)? {
+                            // Some app-based browsers are always Blink-based
+                            const ALWAYS_BLINK_APPS: &[&str] = &[
+                                "TV-Browser Internet",
+                                "XnBrowse",
+                                "Open Browser Lite",
+                            ];
+
+                            if BLINK_REGEX.is_match(ua)? || ALWAYS_BLINK_APPS.contains(&app_name) {
                                 client.engine = Some("Blink".to_owned());
 
                                 if let Some(engine) = &client.engine {
@@ -359,7 +499,7 @@ impl BrowserClientList {
 
         let mut token = engine;
         if engine == "Blink" {
-            token = "(?:Chrome|Cronet)";
+            token = "(?:Chr[o0]me|Cronet)";
         } else if engine == "Arachne" {
             token = "(?:Arachne\\/5\\.)";
         } else if engine == "LibWeb" {

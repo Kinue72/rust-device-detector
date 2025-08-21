@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::Deserialize;
+use fancy_regex::Regex;
 
 use crate::parsers::utils::{lazy_user_agent_match, LazyRegex};
 use once_cell::sync::Lazy;
@@ -108,4 +109,45 @@ impl BrowserEngineList {
         let res: YamlBrowserEngineList = serde_yaml::from_str(contents)?;
         Ok(res.into())
     }
+}
+
+/// Detect engine version from user agent - equivalent to PHP's Engine\Version class
+pub fn detect_engine_version(ua: &str, engine: &str) -> Result<Option<String>> {
+    if engine.is_empty() {
+        return Ok(None);
+    }
+
+    // Gecko and Clecko engines use special pattern
+    if engine == "Gecko" || engine == "Clecko" {
+        let pattern = r"[ ](?:rv[: ]([0-9.]+)).*(?:g|cl)ecko/[0-9]{8,10}";
+        let regex = Regex::new(pattern)?;
+        if let Some(captures) = regex.captures(ua)? {
+            if let Some(version_match) = captures.get(1) {
+                return Ok(Some(version_match.as_str().to_owned()));
+            }
+        }
+        return Ok(None);
+    }
+
+    // Map engine names to regex tokens - from PHP Engine\Version.php
+    let engine_token = match engine {
+        "Blink" => "Chr[o0]me|Chromium|Cronet",
+        "Arachne" => "Arachne\\/5\\.",
+        "LibWeb" => "LibWeb\\+LibJs",
+        _ => engine,
+    };
+
+    // Build the regex pattern - equivalent to PHP line 74
+    // PHP: "~(?:{$engineToken})\s*[/_]?\s*((?(?=\d+\.\d)\d+[.\d]*|\d{1,7}(?=(?:\D|$))))~i"
+    // The conditional regex (?(?=\d+\.\d)\d+[.\d]*|\d{1,7}(?=(?:\D|$))) is complex, let's simplify
+    let pattern = format!(r"(?i)(?:{})\s*[/_]?\s*(\d+(?:\.\d+)*)", engine_token);
+    let regex = Regex::new(&pattern)?;
+    
+    if let Some(captures) = regex.captures(ua)? {
+        if let Some(version_match) = captures.get(1) {
+            return Ok(Some(version_match.as_str().to_owned()));
+        }
+    }
+
+    Ok(None)
 }

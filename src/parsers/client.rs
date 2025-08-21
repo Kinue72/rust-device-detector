@@ -95,11 +95,11 @@ pub fn lookup(ua: &str, client_hints: Option<&ClientHint>) -> Result<Option<Clie
         return Ok(Some(res));
     }
 
-    if let Some(res) = browsers::lookup(ua, client_hints)? {
+    if let Some(res) = libraries::lookup(ua)? {
         return Ok(Some(res));
     }
 
-    if let Some(res) = libraries::lookup(ua)? {
+    if let Some(res) = browsers::lookup(ua, client_hints)? {
         return Ok(Some(res));
     }
 

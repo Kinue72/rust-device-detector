@@ -15,6 +15,7 @@ static DEVICE_LIST: Lazy<DeviceList> = Lazy::new(|| {
     DeviceList::from_file(contents).expect("loading televisions.yml")
 });
 static HBTV: Lazy<Regex> = static_user_agent_match!(r#"HbbTV/([1-9]{1}(?:\.[0-9]{1}){1,2})"#);
+static CE_HTML: Lazy<Regex> = static_user_agent_match!(r#"CE-HTML"#);
 
 pub fn is_hbbtv(ua: &str) -> Result<bool> {
     let res = HBTV.is_match(ua)?;
@@ -22,12 +23,16 @@ pub fn is_hbbtv(ua: &str) -> Result<bool> {
 }
 
 pub fn lookup(ua: &str) -> Result<Option<Device>> {
-    if !is_hbbtv(ua)? {
+    // Check for HbbTV or CE-HTML (both indicate TV-like devices)
+    if !is_hbbtv(ua)? && !CE_HTML.is_match(ua)? {
         return Ok(None);
     }
 
     let res = DEVICE_LIST.lookup(ua, "tv")?.map(|mut res| {
-        res.device_type = Some(DeviceType::Television);
+        // Only set device type to Television if not already set (e.g., could be Peripheral)
+        if res.device_type.is_none() {
+            res.device_type = Some(DeviceType::Television);
+        }
         res
     });
 
